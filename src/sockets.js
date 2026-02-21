@@ -16,19 +16,17 @@ function setupSockets(io) {
   io.on('connection', (socket) => {
     console.log(`[+] connected: ${socket.id}`);
 
-    // ── Dashboard Registration (also joins the worker pool) ─
+    // ── Dashboard Registration ──────────────────────────
     socket.on('register_dashboard', () => {
       state.dashboardSocketIds.add(socket.id);
-      state.availableWorkers.push(socket.id);
-      console.log(`[dashboard+worker] registered: ${socket.id}  (masters: ${state.dashboardSocketIds.size}, pool: ${state.availableWorkers.length})`);
+      // Dashboard does NOT join the worker pool — it only receives render_update results
+      console.log(`[dashboard] registered: ${socket.id}  (masters: ${state.dashboardSocketIds.size}, pool: ${state.availableWorkers.length})`);
 
-      // Send all cached geometries so the dashboard worker is render-ready immediately
+      // Send all cached geometries so late-joining dashboards see the scene
       for (const [masterSocketId, geocache] of state.geocache) {
         socket.emit('sync_geometry', geocache);
         console.log(`[geocache] sent to dashboard ${socket.id} (from master ${masterSocketId})`);
       }
-
-      processQueue(io);
     });
 
     // ── Worker Registration ─────────────────────────────────
@@ -78,6 +76,14 @@ function setupSockets(io) {
     //   Each mesh has byte offsets into the binary buffer:
     //     positions, normals, uvs, indices, ao, vertexColors, bvh
     //   Plus flags: hasNormals, hasUvs, hasBakedData, hasBvhData
+    // ScenePayload.emission: { strength, texture, useEmission } | null
+    //   Emissive data per mesh, controls self-illumination
+    // ScenePayload.diffuse: { bsdf, albedo, roughness, metallic } | null
+    //   BSDF parameters for material properties
+    // ScenePayload.lighting: { ambientIntensity, shadowsEnabled, globalIllumination }
+    //   Scene-level lighting configuration
+    // ScenePayload.shading: { shadingModel, normalMaps, parallaxMapping }
+    //   Shading techniques and normal/parallax mapping flags
     //
     // Server does NOT parse any of this — just relays it verbatim.
     socket.on('sync_geometry', (payload) => {
@@ -97,8 +103,8 @@ function setupSockets(io) {
     // ── Kick Off a Render ───────────────────────────────────
     // Camera comes from the ScenePayload already synced, but the
     // dashboard can override it here. sunDir is a lighting hint.
-    socket.on('start_render', ({ canvasWidth, canvasHeight, camera, sunDir }) => {
-      console.log(`[render] start ${canvasWidth}x${canvasHeight} from master ${socket.id}`);
+    socket.on('start_render', ({ canvasWidth, canvasHeight, camera, sunDir, lights }) => {
+      console.log(`[render] start ${canvasWidth}x${canvasHeight} from master ${socket.id}, ${(lights || []).length} lights`);
 
       // Slice the canvas into a grid of TILE_SIZE × TILE_SIZE chunks
       // Each tile carries the full context a worker's Web Worker needs
@@ -115,6 +121,7 @@ function setupSockets(io) {
             canvasHeight,
             camera,
             sunDir,
+            lights: lights || [],
             masterSocketId: socket.id,
           });
         }
@@ -157,6 +164,15 @@ function setupSockets(io) {
       // Retrieve the in-flight task to find the owning master
       const task = state.activeTasks.get(socket.id);
       state.activeTasks.delete(socket.id);
+
+      // If the payload is a skip (dashboard can't render), re-queue the tile
+      if (payload.skip && task) {
+        state.taskQueue.unshift(task);
+        console.log(`[tile] dashboard ${socket.id} skipped tile (${task.startX},${task.startY}) — re-queued`);
+        // Don't put dashboard back in available workers to avoid ping-pong
+        processQueue(io);
+        return;
+      }
 
       // Route rendered pixels to the correct master using masterSocketId
       const masterSocketId = payload.masterSocketId || task?.masterSocketId;
