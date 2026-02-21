@@ -12,6 +12,10 @@ function processQueue(io) {
   while (state.availableWorkers.length > 0 && state.taskQueue.length > 0) {
     const workerId = state.availableWorkers.shift();
     const task = state.taskQueue.shift();
+
+    // Track in-flight work so we can re-queue if the worker drops
+    state.activeTasks.set(workerId, task);
+
     io.to(workerId).emit('assign_tile', task);
   }
 }

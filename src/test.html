@@ -50,6 +50,7 @@
     <h2>Worker Simulator</h2>
     <button onclick="spawnWorker()">Spawn Fake Worker</button>
     <button onclick="spawnWorkers(3)" class="secondary">Spawn 3 Workers</button>
+    <button onclick="killOneWorker()" style="background:#e67e22;">Kill 1 Worker</button>
     <button onclick="killAllWorkers()" style="background:#c0392b;">Kill All Workers</button>
     <p style="margin-top: 12px;">
       Active workers: <span id="worker-count">0</span>
@@ -101,6 +102,39 @@
     log(`⬅ sync_geometry received (${data.byteLength || data.length} bytes)`, 'log-in');
   });
 
+  // Listen for worker disconnect notifications from server
+  socket.on('worker_disconnected', ({ workerId, reason, tileRescued, remainingWorkers, pendingTiles }) => {
+    let msg = `⚠ WORKER DROPPED: ${workerId} (${reason}) — ${remainingWorkers} workers left, ${pendingTiles} tiles pending`;
+    if (tileRescued) {
+      msg += ` — tile (${tileRescued.startX},${tileRescued.startY}) RESCUED and re-queued`;
+    }
+    log(msg, 'log-err');
+  });
+
+  // Dashboard is ALSO a worker — handle assign_tile on the main socket
+  socket.on('assign_tile', (task) => {
+    log(`⬅ [dashboard-worker] assign_tile (${task.startX},${task.startY}) ${task.width}×${task.height}`, 'log-in');
+
+    // Simulate render work (50-200ms)
+    setTimeout(() => {
+      const fakeBuffer = new Uint8Array(task.width * task.height * 4);
+      for (let i = 0; i < fakeBuffer.length; i += 4) {
+        fakeBuffer[i]   = 100 + Math.random() * 80;  // R (warmish — distinguish from phone workers)
+        fakeBuffer[i+1] = 50  + Math.random() * 40;   // G
+        fakeBuffer[i+2] = 150 + Math.random() * 100;  // B
+        fakeBuffer[i+3] = 255;                         // A
+      }
+      socket.emit('tile_finished', {
+        buffer: fakeBuffer.buffer,
+        startX: task.startX,
+        startY: task.startY,
+        width: task.width,
+        height: task.height,
+      });
+      log(`➡ [dashboard-worker] tile_finished (${task.startX},${task.startY})`, 'log-out');
+    }, 50 + Math.random() * 150);
+  });
+
   // ── Dashboard controls ──────────────────────────────────
   function registerDashboard() {
     socket.emit('register_dashboard');
@@ -117,7 +151,7 @@
 
   function startRender() {
     tilesReceived = 0;
-    socket.emit('start_render', { canvasWidth: 320, canvasHeight: 240, camera: { x: 0, y: 0, z: 5 } });
+    socket.emit('start_render', { canvasWidth: 320, canvasHeight: 240, cameraPos: { x: 0, y: 0, z: 5 }, sunDir: { x: 1, y: 1, z: -1 } });
     log('➡ start_render 320×240', 'log-out');
   }
 
@@ -173,6 +207,20 @@
     workers.length = 0;
     updateWorkerCount();
     log('killed all simulated workers', 'log-err');
+  }
+
+  function killOneWorker() {
+    if (workers.length === 0) {
+      log('no workers to kill', 'log-err');
+      return;
+    }
+    // Kill a random worker to simulate a real-world drop
+    const idx = Math.floor(Math.random() * workers.length);
+    const w = workers[idx];
+    log(`killing worker ${w.id} (may be mid-render)...`, 'log-err');
+    w.disconnect();
+    workers.splice(idx, 1);
+    updateWorkerCount();
   }
 
   function updateWorkerCount() {
