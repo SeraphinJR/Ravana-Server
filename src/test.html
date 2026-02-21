@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Ravana — Socket Test</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+    body { background: #0e0e10; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 1.4rem; margin-bottom: 16px; color: #ff6b35; }
+    .panels { display: flex; gap: 16px; flex-wrap: wrap; }
+    .panel { background: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 16px; flex: 1; min-width: 280px; }
+    .panel h2 { font-size: 1rem; margin-bottom: 12px; color: #8ab4f8; }
+    button { background: #ff6b35; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 4px; font-size: 0.85rem; }
+    button:hover { background: #ff8c5a; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    button.secondary { background: #2d5aa0; }
+    button.secondary:hover { background: #3d6ab0; }
+    #log { background: #111; border: 1px solid #333; border-radius: 6px; padding: 12px; margin-top: 16px;
+            max-height: 400px; overflow-y: auto; font-family: 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.6; }
+    .log-in  { color: #4caf50; }
+    .log-out { color: #ff9800; }
+    .log-sys { color: #888; }
+    .log-err { color: #f44336; }
+    .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+    .status.on  { background: #4caf50; }
+    .status.off { background: #f44336; }
+    #worker-count { color: #8ab4f8; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+<h1>🔱 Ravana — Socket.io Test Console</h1>
+
+<div class="panels">
+  <!-- Dashboard Panel -->
+  <div class="panel">
+    <h2>Dashboard Controls</h2>
+    <button onclick="registerDashboard()">Register as Dashboard</button>
+    <button onclick="sendGeometry()" class="secondary">Send Fake Geometry</button>
+    <button onclick="startRender()" class="secondary">Start Render (320×240)</button>
+    <p style="margin-top: 12px;">
+      <span id="dash-status" class="status off"></span>
+      Dashboard: <span id="dash-id">not registered</span>
+    </p>
+  </div>
+
+  <!-- Worker Panel -->
+  <div class="panel">
+    <h2>Worker Simulator</h2>
+    <button onclick="spawnWorker()">Spawn Fake Worker</button>
+    <button onclick="spawnWorkers(3)" class="secondary">Spawn 3 Workers</button>
+    <button onclick="killAllWorkers()" style="background:#c0392b;">Kill All Workers</button>
+    <p style="margin-top: 12px;">
+      Active workers: <span id="worker-count">0</span>
+    </p>
+  </div>
+
+  <!-- Info Panel -->
+  <div class="panel">
+    <h2>Connection</h2>
+    <p><span id="conn-status" class="status off"></span> Main socket: <span id="conn-id">—</span></p>
+    <button onclick="location.reload()" style="background:#555; margin-top: 8px;">Reset All</button>
+  </div>
+</div>
+
+<div id="log"></div>
+
+<script>
+  const logEl = document.getElementById('log');
+  const socket = io('http://localhost:3000');
+  const workers = [];          // array of worker socket instances
+  let tilesReceived = 0;
+
+  // ── Logging helper ──────────────────────────────────────
+  function log(msg, cls = 'log-sys') {
+    const t = new Date().toLocaleTimeString();
+    logEl.innerHTML += `<div class="${cls}"><span style="color:#666">[${t}]</span> ${msg}</div>`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ── Main socket events ──────────────────────────────────
+  socket.on('connect', () => {
+    document.getElementById('conn-status').className = 'status on';
+    document.getElementById('conn-id').textContent = socket.id;
+    log(`connected as <b>${socket.id}</b>`, 'log-sys');
+  });
+
+  socket.on('disconnect', () => {
+    document.getElementById('conn-status').className = 'status off';
+    document.getElementById('conn-id').textContent = '—';
+    log('disconnected', 'log-err');
+  });
+
+  socket.on('render_update', (payload) => {
+    tilesReceived++;
+    log(`⬅ render_update tile (${payload.startX},${payload.startY}) ${payload.width}×${payload.height}  [total: ${tilesReceived}]`, 'log-in');
+  });
+
+  socket.on('sync_geometry', (data) => {
+    log(`⬅ sync_geometry received (${data.byteLength || data.length} bytes)`, 'log-in');
+  });
+
+  // ── Dashboard controls ──────────────────────────────────
+  function registerDashboard() {
+    socket.emit('register_dashboard');
+    document.getElementById('dash-status').className = 'status on';
+    document.getElementById('dash-id').textContent = socket.id;
+    log('➡ register_dashboard', 'log-out');
+  }
+
+  function sendGeometry() {
+    const fakeVerts = new Float32Array([0,0,0, 1,0,0, 0,1,0, 1,1,0, 0,0,1, 1,0,1]);
+    socket.emit('sync_geometry', fakeVerts.buffer);
+    log(`➡ sync_geometry (${fakeVerts.byteLength} bytes, ${fakeVerts.length / 3} verts)`, 'log-out');
+  }
+
+  function startRender() {
+    tilesReceived = 0;
+    socket.emit('start_render', { canvasWidth: 320, canvasHeight: 240, camera: { x: 0, y: 0, z: 5 } });
+    log('➡ start_render 320×240', 'log-out');
+  }
+
+  // ── Worker simulator ────────────────────────────────────
+  function spawnWorker() {
+    const w = io('http://localhost:3000');
+    workers.push(w);
+    updateWorkerCount();
+
+    w.on('connect', () => {
+      w.emit('register_worker');
+      log(`[worker ${w.id}] registered`, 'log-sys');
+    });
+
+    w.on('sync_geometry', (data) => {
+      log(`[worker ${w.id}] ⬅ got geometry (${data.byteLength || '?'} bytes)`, 'log-in');
+    });
+
+    w.on('assign_tile', (task) => {
+      log(`[worker ${w.id}] ⬅ assign_tile (${task.startX},${task.startY}) ${task.width}×${task.height}`, 'log-in');
+
+      // Simulate render work (50-200ms)
+      setTimeout(() => {
+        const fakeBuffer = new Uint8Array(task.width * task.height * 4); // RGBA
+        for (let i = 0; i < fakeBuffer.length; i += 4) {
+          fakeBuffer[i]   = Math.random() * 255;  // R
+          fakeBuffer[i+1] = Math.random() * 255;  // G
+          fakeBuffer[i+2] = Math.random() * 255;  // B
+          fakeBuffer[i+3] = 255;                   // A
+        }
+        w.emit('tile_finished', {
+          buffer: fakeBuffer.buffer,
+          startX: task.startX,
+          startY: task.startY,
+          width: task.width,
+          height: task.height,
+        });
+        log(`[worker ${w.id}] ➡ tile_finished (${task.startX},${task.startY})`, 'log-out');
+      }, 50 + Math.random() * 150);
+    });
+
+    w.on('disconnect', () => {
+      log(`[worker ${w.id}] disconnected`, 'log-err');
+    });
+  }
+
+  function spawnWorkers(n) {
+    for (let i = 0; i < n; i++) setTimeout(() => spawnWorker(), i * 100);
+  }
+
+  function killAllWorkers() {
+    workers.forEach(w => w.disconnect());
+    workers.length = 0;
+    updateWorkerCount();
+    log('killed all simulated workers', 'log-err');
+  }
+
+  function updateWorkerCount() {
+    document.getElementById('worker-count').textContent = workers.length;
+  }
+</script>
+
+</body>
+</html>
