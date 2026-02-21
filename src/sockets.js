@@ -158,14 +158,22 @@ function setupSockets(io) {
       const task = state.activeTasks.get(socket.id);
       state.activeTasks.delete(socket.id);
 
+      // Merge task metadata (canvasWidth, canvasHeight, masterSocketId) into the payload
+      const enrichedPayload = {
+        ...payload,
+        canvasWidth: payload.canvasWidth || task?.canvasWidth,
+        canvasHeight: payload.canvasHeight || task?.canvasHeight,
+        masterSocketId: payload.masterSocketId || task?.masterSocketId,
+      };
+
       // Route rendered pixels to the correct master using masterSocketId
-      const masterSocketId = payload.masterSocketId || task?.masterSocketId;
+      const masterSocketId = enrichedPayload.masterSocketId;
       if (masterSocketId && state.dashboardSocketIds.has(masterSocketId)) {
-        io.to(masterSocketId).emit('render_update', payload);
+        io.to(masterSocketId).emit('listen_tiles', enrichedPayload);
       } else if (state.dashboardSocketIds.size > 0) {
         // Fallback: send to all masters if we can't determine the owner
         for (const dashId of state.dashboardSocketIds) {
-          io.to(dashId).emit('render_update', payload);
+          io.to(dashId).emit('listen_tiles', enrichedPayload);
         }
       }
 
