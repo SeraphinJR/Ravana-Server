@@ -6,7 +6,7 @@
 const state = require('./state');
 const { processQueue } = require('./queue');
 
-const TILE_SIZE = 64; // pixels per chunk edge
+const DEFAULT_TILE_SIZE = 64; // pixels per chunk edge (default)
 
 /**
  * Wire up every Socket.io event the system cares about.
@@ -97,20 +97,21 @@ function setupSockets(io) {
     // ── Kick Off a Render ───────────────────────────────────
     // Camera comes from the ScenePayload already synced, but the
     // dashboard can override it here. sunDir is a lighting hint.
-    socket.on('start_render', ({ canvasWidth, canvasHeight, camera, sunDir }) => {
-      console.log(`[render] start ${canvasWidth}x${canvasHeight} from master ${socket.id}`);
+    socket.on('start_render', ({ canvasWidth, canvasHeight, tileSize, camera, sunDir }) => {
+      const effectiveTileSize = tileSize || DEFAULT_TILE_SIZE;
+      console.log(`[render] start ${canvasWidth}x${canvasHeight} (tile: ${effectiveTileSize}px) from master ${socket.id}`);
 
-      // Slice the canvas into a grid of TILE_SIZE × TILE_SIZE chunks
+      // Slice the canvas into a grid of tileSize × tileSize chunks
       // Each tile carries the full context a worker's Web Worker needs
       // (scene geometry is already on each device via sync_geometry)
       // masterSocketId tags each tile so results route to the correct master
-      for (let y = 0; y < canvasHeight; y += TILE_SIZE) {
-        for (let x = 0; x < canvasWidth; x += TILE_SIZE) {
+      for (let y = 0; y < canvasHeight; y += effectiveTileSize) {
+        for (let x = 0; x < canvasWidth; x += effectiveTileSize) {
           state.taskQueue.push({
             startX: x,
             startY: y,
-            width: Math.min(TILE_SIZE, canvasWidth - x),
-            height: Math.min(TILE_SIZE, canvasHeight - y),
+            width: Math.min(effectiveTileSize, canvasWidth - x),
+            height: Math.min(effectiveTileSize, canvasHeight - y),
             canvasWidth,
             canvasHeight,
             camera,
@@ -158,22 +159,14 @@ function setupSockets(io) {
       const task = state.activeTasks.get(socket.id);
       state.activeTasks.delete(socket.id);
 
-      // Merge task metadata (canvasWidth, canvasHeight, masterSocketId) into the payload
-      const enrichedPayload = {
-        ...payload,
-        canvasWidth: payload.canvasWidth || task?.canvasWidth,
-        canvasHeight: payload.canvasHeight || task?.canvasHeight,
-        masterSocketId: payload.masterSocketId || task?.masterSocketId,
-      };
-
       // Route rendered pixels to the correct master using masterSocketId
-      const masterSocketId = enrichedPayload.masterSocketId;
+      const masterSocketId = payload.masterSocketId || task?.masterSocketId;
       if (masterSocketId && state.dashboardSocketIds.has(masterSocketId)) {
-        io.to(masterSocketId).emit('listen_tiles', enrichedPayload);
+        io.to(masterSocketId).emit('render_update', payload);
       } else if (state.dashboardSocketIds.size > 0) {
         // Fallback: send to all masters if we can't determine the owner
         for (const dashId of state.dashboardSocketIds) {
-          io.to(dashId).emit('listen_tiles', enrichedPayload);
+          io.to(dashId).emit('render_update', payload);
         }
       }
 
