@@ -99,7 +99,9 @@
   });
 
   socket.on('sync_geometry', (data) => {
-    log(`⬅ sync_geometry received (${data.byteLength || data.length} bytes)`, 'log-in');
+    const bytes = data.buffer?.byteLength ?? data.byteLength ?? JSON.stringify(data).length;
+    const master = data.masterSocketId ?? 'unknown';
+    log(`⬅ sync_geometry received from master <b>${master}</b> (${bytes} bytes, ${data.geometry?.meshCount ?? '?'} meshes)`, 'log-in');
   });
 
   // Listen for worker disconnect notifications from server
