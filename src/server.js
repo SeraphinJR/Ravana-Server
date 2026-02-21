@@ -15,6 +15,7 @@ const io = new Server(server, {
     origin: '*',
     methods: ['GET', 'POST'],
   },
+  maxHttpBufferSize: 1e8
 });
 
 // Health-check endpoint (handy for hackathon demos)
