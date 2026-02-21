@@ -144,14 +144,62 @@
   }
 
   function sendGeometry() {
-    const fakeVerts = new Float32Array([0,0,0, 1,0,0, 0,1,0, 1,1,0, 0,0,1, 1,0,1]);
-    socket.emit('sync_geometry', fakeVerts.buffer);
-    log(`➡ sync_geometry (${fakeVerts.byteLength} bytes, ${fakeVerts.length / 3} verts)`, 'log-out');
+    // Mock a ScenePayload matching the real client format
+    const fakePositions = new Float32Array([0,0,0, 1,0,0, 0,1,0, 1,1,0, 0,0,1, 1,0,1]);
+    const payload = {
+      timestamp: Date.now(),
+      version: '1.0.0',
+      camera: {
+        position: { x: 0, y: 2, z: 5 },
+        rotation: { x: 0, y: 0, z: 0 },
+        target: { x: 0, y: 0, z: 0 },
+        fov: 75,
+        near: 0.1,
+        far: 1000,
+      },
+      geometry: {
+        meshCount: 1,
+        totalVertices: 6,
+        totalIndices: 0,
+        meshes: [{
+          name: 'testCube',
+          vertexCount: 6,
+          indexCount: 0,
+          hasNormals: false,
+          hasUvs: false,
+          hasBakedData: false,
+          hasBvhData: false,
+          positionsOffset: 0,
+          positionsLength: fakePositions.byteLength,
+          normalsOffset: 0, normalsLength: 0,
+          uvsOffset: 0, uvsLength: 0,
+          indicesOffset: 0, indicesLength: 0,
+          aoOffset: 0, aoLength: 0,
+          vertexColorsOffset: 0, vertexColorsLength: 0,
+          bvhOffset: 0, bvhLength: 0,
+        }],
+      },
+      buffer: fakePositions.buffer,
+    };
+    socket.emit('sync_geometry', payload);
+    log(`➡ sync_geometry (${payload.geometry.meshCount} mesh, ${payload.geometry.totalVertices} verts, ${fakePositions.byteLength}B buffer)`, 'log-out');
   }
 
   function startRender() {
     tilesReceived = 0;
-    socket.emit('start_render', { canvasWidth: 320, canvasHeight: 240, cameraPos: { x: 0, y: 0, z: 5 }, sunDir: { x: 1, y: 1, z: -1 } });
+    socket.emit('start_render', {
+      canvasWidth: 320,
+      canvasHeight: 240,
+      camera: {
+        position: { x: 0, y: 2, z: 5 },
+        rotation: { x: 0, y: 0, z: 0 },
+        target: { x: 0, y: 0, z: 0 },
+        fov: 75,
+        near: 0.1,
+        far: 1000,
+      },
+      sunDir: { x: 1, y: 1, z: -1 },
+    });
     log('➡ start_render 320×240', 'log-out');
   }
 

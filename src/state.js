@@ -9,7 +9,7 @@ module.exports = {
   /** @type {string[]} Pool of idle worker socket IDs ready to receive tiles */
   availableWorkers: [],
 
-  /** @type {{ startX: number, startY: number, width: number, height: number, canvasWidth: number, canvasHeight: number, cameraPos: object, sunDir: object }[]} */
+  /** @type {{ startX: number, startY: number, width: number, height: number, canvasWidth: number, canvasHeight: number, camera: object, sunDir: object }[]} */
   taskQueue: [],
 
   /** @type {Map<string, object>} Maps workerId → the tile it's currently rendering */

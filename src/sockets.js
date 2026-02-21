@@ -31,22 +31,32 @@ function setupSockets(io) {
       processQueue(io);
     });
 
-    // ── Geometry Sync (positions + BVH broadcast) ───────────
-    // Dashboard sends { positions: Float32Array, bvhBuffer: Float32Array }
-    // Server relays both buffers to every worker.
+    // ── Scene Sync (ScenePayload broadcast) ────────────────
+    // Dashboard sends { json: ScenePayload, buffer: ArrayBuffer }
+    //
+    // ScenePayload.camera:  { position, rotation, target, fov, near, far } | null
+    // ScenePayload.geometry: { meshCount, totalVertices, totalIndices, meshes[] }
+    //   Each mesh has byte offsets into the binary buffer:
+    //     positions, normals, uvs, indices, ao, vertexColors, bvh
+    //   Plus flags: hasNormals, hasUvs, hasBakedData, hasBvhData
+    //
+    // Server does NOT parse any of this — just relays it verbatim.
     socket.on('sync_geometry', (payload) => {
-      console.log('[geometry] broadcasting positions + BVH to all workers');
+      const meshCount = payload?.geometry?.meshCount ?? '?';
+      const totalVerts = payload?.geometry?.totalVertices ?? '?';
+      console.log(`[geometry] broadcasting scene (${meshCount} meshes, ${totalVerts} verts) to all workers`);
       socket.broadcast.emit('sync_geometry', payload);
     });
 
     // ── Kick Off a Render ───────────────────────────────────
-    socket.on('start_render', ({ canvasWidth, canvasHeight, cameraPos, sunDir }) => {
+    // Camera comes from the ScenePayload already synced, but the
+    // dashboard can override it here. sunDir is a lighting hint.
+    socket.on('start_render', ({ canvasWidth, canvasHeight, camera, sunDir }) => {
       console.log(`[render] start ${canvasWidth}x${canvasHeight}`);
 
-      // Slice the canvas 
-      // o a grid of TILE_SIZE × TILE_SIZE chunks
+      // Slice the canvas into a grid of TILE_SIZE × TILE_SIZE chunks
       // Each tile carries the full context a worker's Web Worker needs
-      // (positions + bvhBuffer are already on each device via sync_geometry)
+      // (scene geometry is already on each device via sync_geometry)
       for (let y = 0; y < canvasHeight; y += TILE_SIZE) {
         for (let x = 0; x < canvasWidth; x += TILE_SIZE) {
           state.taskQueue.push({
@@ -56,7 +66,7 @@ function setupSockets(io) {
             height: Math.min(TILE_SIZE, canvasHeight - y),
             canvasWidth,
             canvasHeight,
-            cameraPos,
+            camera,
             sunDir,
           });
         }
