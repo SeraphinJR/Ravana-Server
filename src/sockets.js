@@ -103,25 +103,29 @@ function setupSockets(io) {
     // ── Kick Off a Render ───────────────────────────────────
     // Camera comes from the ScenePayload already synced, but the
     // dashboard can override it here. sunDir is a lighting hint.
-    socket.on('start_render', ({ canvasWidth, canvasHeight, camera, sunDir, lights }) => {
-      console.log(`[render] start ${canvasWidth}x${canvasHeight} from master ${socket.id}, ${(lights || []).length} lights`);
+    socket.on('start_render', ({ canvasWidth, canvasHeight, camera, sunDir, lights, samples, tileSize }) => {
+      console.log(`[render] start ${canvasWidth}x${canvasHeight} from master ${socket.id}, ${(lights || []).length} lights, ${samples || 16} samples, ${tileSize || TILE_SIZE}px tiles`);
 
-      // Slice the canvas into a grid of TILE_SIZE × TILE_SIZE chunks
+      // Use custom tile size if provided, otherwise default
+      const activeTileSize = tileSize || TILE_SIZE;
+      
+      // Slice the canvas into a grid of activeTileSize × activeTileSize chunks
       // Each tile carries the full context a worker's Web Worker needs
       // (scene geometry is already on each device via sync_geometry)
       // masterSocketId tags each tile so results route to the correct master
-      for (let y = 0; y < canvasHeight; y += TILE_SIZE) {
-        for (let x = 0; x < canvasWidth; x += TILE_SIZE) {
+      for (let y = 0; y < canvasHeight; y += activeTileSize) {
+        for (let x = 0; x < canvasWidth; x += activeTileSize) {
           state.taskQueue.push({
             startX: x,
             startY: y,
-            width: Math.min(TILE_SIZE, canvasWidth - x),
-            height: Math.min(TILE_SIZE, canvasHeight - y),
+            width: Math.min(activeTileSize, canvasWidth - x),
+            height: Math.min(activeTileSize, canvasHeight - y),
             canvasWidth,
             canvasHeight,
             camera,
             sunDir,
             lights: lights || [],
+            samples: samples || 16,
             masterSocketId: socket.id,
           });
         }
