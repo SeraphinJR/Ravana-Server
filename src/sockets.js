@@ -4,7 +4,7 @@
 // Does zero math — just moves bytes around as fast as possible.
 
 const state = require('./state');
-const { processQueue } = require('./queue');
+const { processQueue, clearTaskTimeout } = require('./queue');
 
 const TILE_SIZE = 64; // pixels per chunk edge
 
@@ -33,12 +33,12 @@ function setupSockets(io) {
     // Workers register to one or more masters by passing { masterSocketId }.
     // Call multiple times with different masterSocketIds to serve several masters.
     // Each tile carries its masterSocketId so the worker always knows the owner.
+    // NOTE: Workers are NOT added to availableWorkers until they send 'worker_ready'
     socket.on('register_worker', (data) => {
       const masterSocketId = data?.masterSocketId || null;
 
-      // Only add to available pool on first registration
+      // Initialize worker tracking (but don't add to available pool yet)
       if (!state.workerMasterMap.has(socket.id)) {
-        state.availableWorkers.push(socket.id);
         state.workerMasterMap.set(socket.id, new Set());
       }
 
@@ -48,7 +48,7 @@ function setupSockets(io) {
         const isNew = !masters.has(masterSocketId);
         masters.add(masterSocketId);
 
-        console.log(`[worker] ${socket.id} registered → master ${masterSocketId}  (serving ${masters.size} master(s), pool: ${state.availableWorkers.length})`);
+        console.log(`[worker] ${socket.id} registered → master ${masterSocketId}  (serving ${masters.size} master(s))`);
 
         // Send only the new master's geocache (avoid re-sending ones already delivered)
         if (isNew && state.geocache.has(masterSocketId)) {
@@ -56,7 +56,7 @@ function setupSockets(io) {
           console.log(`[geocache] sent to worker ${socket.id} (from master ${masterSocketId})`);
         }
       } else {
-        console.log(`[worker] ${socket.id} registered → all masters  (pool: ${state.availableWorkers.length})`);
+        console.log(`[worker] ${socket.id} registered → all masters`);
 
         // No specific master — send every cached geocache
         for (const [mId, geocache] of state.geocache) {
@@ -65,6 +65,29 @@ function setupSockets(io) {
         }
       }
 
+      // Don't call processQueue here - wait for worker_ready event
+    });
+
+    // ── Worker Ready Acknowledgment ─────────────────────────
+    // Worker signals it has fully processed geometry and is ready for tasks
+    // This also serves as the completion signal after rendering a tile
+    socket.on('worker_ready', () => {
+      // Remove from any existing position (the worker might have been in activeTasks)
+      const wasActive = state.activeTasks.has(socket.id);
+      state.activeTasks.delete(socket.id);
+      
+      // Remove from available workers if present (for clean re-add)
+      const existingIndex = state.availableWorkers.indexOf(socket.id);
+      if (existingIndex !== -1) {
+        state.availableWorkers.splice(existingIndex, 1);
+      }
+      
+      // Add to available workers pool (at the end for round-robin)
+      state.availableWorkers.push(socket.id);
+      
+      console.log(`[worker] ${socket.id} ready (was: ${wasActive ? 'rendering' : 'idle'}) — pool: ${state.availableWorkers.length}, queue: ${state.taskQueue.length}`);
+      
+      // Process queue to assign any pending tiles
       processQueue(io);
     });
 
@@ -109,6 +132,26 @@ function setupSockets(io) {
       // Use custom tile size if provided, otherwise default
       const activeTileSize = tileSize || TILE_SIZE;
       
+      // Serialize camera data to prevent circular references from Three.js objects
+      const serializedCamera = camera ? {
+        cameraPos: camera.cameraPos,
+        viewMatrix: camera.viewMatrix,
+        fov: camera.fov,
+        sunDir: camera.sunDir,
+        exposure: camera.exposure,
+        lightScale: camera.lightScale,
+        samples: camera.samples
+      } : null;
+      
+      // Serialize lights array to prevent circular references
+      const serializedLights = (lights || []).map(light => ({
+        type: light.type,
+        position: light.position,
+        intensity: light.intensity,
+        color: light.color,
+        // Only copy serializable properties
+      }));
+      
       // Slice the canvas into a grid of activeTileSize × activeTileSize chunks
       // Each tile carries the full context a worker's Web Worker needs
       // (scene geometry is already on each device via sync_geometry)
@@ -122,9 +165,9 @@ function setupSockets(io) {
             height: Math.min(activeTileSize, canvasHeight - y),
             canvasWidth,
             canvasHeight,
-            camera,
-            sunDir,
-            lights: lights || [],
+            camera: serializedCamera,
+            sunDir: sunDir ? { x: sunDir.x, y: sunDir.y, z: sunDir.z } : null,
+            lights: serializedLights,
             samples: samples || 16,
             masterSocketId: socket.id,
           });
@@ -164,34 +207,78 @@ function setupSockets(io) {
     });
 
     // ── Worker Finished a Tile ──────────────────────────────
-    socket.on('tile_finished', (payload) => {
-      // Retrieve the in-flight task to find the owning master
+    // Worker sends rendered tile data. Worker will emit worker_ready when truly ready for next tile.
+    socket.on('tile_finished', (payload, acknowledgeFn) => {
+      const logPrefix = `[tile:${payload.startX},${payload.startY}]`;
+      console.log(`${logPrefix} ${socket.id} finished`);
+      
+      // Retrieve the in-flight task for validation and master lookup
       const task = state.activeTasks.get(socket.id);
+      
+      // Clear timeout if task exists
+      if (task) {
+        clearTaskTimeout(socket.id);
+      }
+      
+      // Validate tile coordinates match assigned task
+      if (task && (task.startX !== payload.startX || task.startY !== payload.startY)) {
+        console.error(`${logPrefix} Coordinate mismatch! Expected (${task.startX},${task.startY}), got (${payload.startX},${payload.startY})`);
+      }
+      
+      // Remove from active tasks (worker is no longer rendering this task)
       state.activeTasks.delete(socket.id);
 
-      // If the payload is a skip (dashboard can't render), re-queue the tile
+      // If the payload is a skip (e.g., dashboard can't render), re-queue the tile
       if (payload.skip && task) {
         state.taskQueue.unshift(task);
-        console.log(`[tile] dashboard ${socket.id} skipped tile (${task.startX},${task.startY}) — re-queued`);
-        // Don't put dashboard back in available workers to avoid ping-pong
+        console.log(`${logPrefix} dashboard ${socket.id} skipped — re-queued`);
+        // Don't add to available workers to avoid dashboard rendering its own tiles
         processQueue(io);
+        
+        // Send acknowledgment
+        if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+          acknowledgeFn({ status: 'skipped', requeued: true });
+        }
         return;
       }
 
-      // Route rendered pixels to the correct master using masterSocketId
+      // Route rendered pixels to the correct master
       const masterSocketId = payload.masterSocketId || task?.masterSocketId;
+      
+      if (!masterSocketId) {
+        console.error(`${logPrefix} No masterSocketId! Worker: ${socket.id}, Task: ${!!task}`);
+        if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+          acknowledgeFn({ status: 'error', error: 'No master ID' });
+        }
+        return;
+      }
+      
+      // Send tile to master dashboard with acknowledgment
       if (masterSocketId && state.dashboardSocketIds.has(masterSocketId)) {
-        io.to(masterSocketId).emit('render_update', payload);
+        io.to(masterSocketId).emit('render_update', payload, (dashboardAck) => {
+          if (dashboardAck && dashboardAck.status === 'received') {
+            console.log(`${logPrefix} Delivered to master ${masterSocketId}`);
+          } else {
+            console.warn(`${logPrefix} Master ${masterSocketId} did not acknowledge receipt`);
+          }
+        });
       } else if (state.dashboardSocketIds.size > 0) {
-        // Fallback: send to all masters if we can't determine the owner
+        // Fallback: broadcast to all dashboards
+        console.warn(`${logPrefix} Master ${masterSocketId} not found, broadcasting`);
         for (const dashId of state.dashboardSocketIds) {
           io.to(dashId).emit('render_update', payload);
         }
+      } else {
+        console.error(`${logPrefix} No dashboards connected!`);
       }
-
-      // Return the worker to the pool and keep draining
-      state.availableWorkers.push(socket.id);
-      processQueue(io);
+      
+      // Send acknowledgment to worker
+      if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+        acknowledgeFn({ status: 'received' });
+      }
+      
+      // Note: Worker will emit worker_ready when truly ready for next tile
+      // This prevents assigning the next tile before worker has finished cleanup
     });
 
     // ── Disconnect Cleanup ──────────────────────────────────
@@ -217,6 +304,7 @@ function setupSockets(io) {
         let purgedActive = 0;
         for (const [workerId, task] of state.activeTasks) {
           if (task.masterSocketId === socket.id) {
+            clearTaskTimeout(workerId);
             state.activeTasks.delete(workerId);
             // Return the worker to the pool since its task is now void
             state.availableWorkers.push(workerId);
@@ -254,6 +342,7 @@ function setupSockets(io) {
       // FRONT of the queue so it gets picked up next.
       const orphanedTask = state.activeTasks.get(socket.id);
       if (orphanedTask) {
+        clearTaskTimeout(socket.id);
         state.activeTasks.delete(socket.id);
         state.taskQueue.unshift(orphanedTask);
         console.error(`[rescue] tile (${orphanedTask.startX},${orphanedTask.startY}) re-queued — queue: ${state.taskQueue.length}`);
