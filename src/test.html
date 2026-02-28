@@ -26,6 +26,27 @@
     .status.on  { background: #4caf50; }
     .status.off { background: #f44336; }
     #worker-count { color: #8ab4f8; font-weight: bold; }
+
+    /* Render canvas section */
+    .render-section { margin-top: 16px; background: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 16px; }
+    .render-section h2 { font-size: 1rem; margin-bottom: 12px; color: #8ab4f8; }
+    .render-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+    .render-stats { display: flex; gap: 16px; flex-wrap: wrap; }
+    .render-stat { background: #111; border: 1px solid #333; border-radius: 6px; padding: 6px 12px; font-size: 0.8rem; }
+    .render-stat .label { color: #888; font-size: 0.7rem; text-transform: uppercase; }
+    .render-stat .value { color: #8ab4f8; font-weight: bold; font-family: 'Fira Code', monospace; }
+    .canvas-wrap { position: relative; display: inline-block; background: #000; border-radius: 4px; overflow: hidden; }
+    #render-canvas { display: block; image-rendering: pixelated; }
+    #overlay-canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+    .pixel-info { margin-top: 8px; font-family: 'Fira Code', monospace; font-size: 0.75rem; color: #aaa; min-height: 20px; }
+    .progress-bar { width: 100%; height: 6px; background: #333; border-radius: 3px; overflow: hidden; margin-top: 8px; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #4caf50, #8ab4f8); transition: width 0.15s; }
+    .tile-list { max-height: 200px; overflow-y: auto; margin-top: 8px; font-family: 'Fira Code', monospace; font-size: 0.72rem; }
+    .tile-entry { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px solid #222; }
+    .tile-entry .tile-coord { color: #ff9800; min-width: 100px; }
+    .tile-entry .tile-time { color: #4caf50; min-width: 60px; }
+    .tile-entry .tile-avg { color: #8ab4f8; }
+    .tile-entry .tile-range { color: #888; }
   </style>
 </head>
 <body>
@@ -65,6 +86,37 @@
   </div>
 </div>
 
+<!-- Render Output Section -->
+<div class="render-section" id="render-section" style="display:none;">
+  <div class="render-header">
+    <h2>🖼 Render Output</h2>
+    <div>
+      <button onclick="toggleOverlay()" class="secondary" style="font-size:0.75rem;">Toggle Grid</button>
+      <button onclick="downloadRender()" class="secondary" style="font-size:0.75rem;">Download PNG</button>
+      <button onclick="clearCanvas()" style="background:#555; font-size:0.75rem;">Clear</button>
+    </div>
+  </div>
+  <div class="render-stats">
+    <div class="render-stat"><div class="label">Tiles</div><div class="value"><span id="stat-tiles">0</span> / <span id="stat-total">?</span></div></div>
+    <div class="render-stat"><div class="label">Elapsed</div><div class="value" id="stat-elapsed">—</div></div>
+    <div class="render-stat"><div class="label">Avg Tile</div><div class="value" id="stat-avg-tile">—</div></div>
+    <div class="render-stat"><div class="label">Pixels Rendered</div><div class="value" id="stat-pixels">0</div></div>
+    <div class="render-stat"><div class="label">Throughput</div><div class="value" id="stat-throughput">—</div></div>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+  <div style="margin-top: 12px;">
+    <div class="canvas-wrap">
+      <canvas id="render-canvas" width="320" height="240"></canvas>
+      <canvas id="overlay-canvas" width="320" height="240"></canvas>
+    </div>
+    <div class="pixel-info" id="pixel-info">Hover over the canvas to inspect pixels</div>
+  </div>
+  <details style="margin-top:8px;">
+    <summary style="cursor:pointer; color:#8ab4f8; font-size:0.85rem;">Tile Log (per-tile stats)</summary>
+    <div class="tile-list" id="tile-list"></div>
+  </details>
+</div>
+
 <div id="log"></div>
 
 <script>
@@ -72,6 +124,20 @@
   const socket = io('http://localhost:3000');
   const workers = [];          // array of worker socket instances
   let tilesReceived = 0;
+
+  // ── Render canvas state ─────────────────────────────────
+  const renderCanvas = document.getElementById('render-canvas');
+  const renderCtx = renderCanvas.getContext('2d');
+  const overlayCanvas = document.getElementById('overlay-canvas');
+  const overlayCtx = overlayCanvas.getContext('2d');
+  let showOverlay = true;
+  let renderW = 320, renderH = 240;
+  let totalTiles = 0;
+  let renderStartTime = null;
+  let elapsedTimer = null;
+  let totalPixelsRendered = 0;
+  const tileTimings = [];       // { startX, startY, width, height, arrivedAt, avgColor, minMax }
+  const tileArrivals = new Map(); // key "x,y" → timestamp of dispatch (approximate)
 
   // ── Logging helper ──────────────────────────────────────
   function log(msg, cls = 'log-sys') {
@@ -95,7 +161,74 @@
 
   socket.on('render_update', (payload) => {
     tilesReceived++;
-    log(`⬅ render_update tile (${payload.startX},${payload.startY}) ${payload.width}×${payload.height}  [total: ${tilesReceived}]`, 'log-in');
+    const arrivedAt = Date.now();
+    const { startX, startY, width, height } = payload;
+
+    // Ensure proper ArrayBuffer
+    const raw = payload.buffer instanceof ArrayBuffer
+      ? payload.buffer
+      : new Uint8Array(payload.buffer).buffer;
+    const pixels = new Uint8ClampedArray(raw);
+
+    // Paint tile onto canvas
+    try {
+      const imageData = new ImageData(pixels, width, height);
+      renderCtx.putImageData(imageData, startX, startY);
+    } catch (e) {
+      log(`⬅ render_update ERROR painting tile (${startX},${startY}): ${e.message}`, 'log-err');
+    }
+
+    // Analyze pixel data: average color, min/max luminance
+    let rSum = 0, gSum = 0, bSum = 0, minLum = 255, maxLum = 0;
+    const pxCount = width * height;
+    for (let i = 0; i < pixels.length; i += 4) {
+      rSum += pixels[i]; gSum += pixels[i+1]; bSum += pixels[i+2];
+      const lum = 0.299 * pixels[i] + 0.587 * pixels[i+1] + 0.114 * pixels[i+2];
+      if (lum < minLum) minLum = lum;
+      if (lum > maxLum) maxLum = lum;
+    }
+    const avgR = Math.round(rSum / pxCount);
+    const avgG = Math.round(gSum / pxCount);
+    const avgB = Math.round(bSum / pxCount);
+
+    totalPixelsRendered += pxCount;
+
+    const entry = { startX, startY, width, height, arrivedAt, avgR, avgG, avgB, minLum: Math.round(minLum), maxLum: Math.round(maxLum) };
+    tileTimings.push(entry);
+
+    // Update stats UI
+    document.getElementById('stat-tiles').textContent = tilesReceived;
+    document.getElementById('stat-pixels').textContent = totalPixelsRendered.toLocaleString();
+    if (totalTiles > 0) {
+      const pct = Math.min(100, (tilesReceived / totalTiles) * 100);
+      document.getElementById('progress-fill').style.width = pct + '%';
+    }
+    updateThroughput();
+    updateAvgTile();
+
+    // Draw overlay grid for this tile
+    if (showOverlay) drawTileOverlay(startX, startY, width, height, tilesReceived);
+
+    // Add to tile log
+    const elapsed = renderStartTime ? ((arrivedAt - renderStartTime) / 1000).toFixed(2) : '?';
+    const tileListEl = document.getElementById('tile-list');
+    tileListEl.innerHTML += `<div class="tile-entry">`
+      + `<span class="tile-coord">(${startX},${startY}) ${width}×${height}</span>`
+      + `<span class="tile-time">+${elapsed}s</span>`
+      + `<span class="tile-avg" style="color:rgb(${avgR},${avgG},${avgB})">avg(${avgR},${avgG},${avgB})</span>`
+      + `<span class="tile-range">lum ${entry.minLum}–${entry.maxLum}</span>`
+      + `</div>`;
+    tileListEl.scrollTop = tileListEl.scrollHeight;
+
+    // Check for completion
+    if (tilesReceived === totalTiles) {
+      clearInterval(elapsedTimer);
+      const totalTime = ((Date.now() - renderStartTime) / 1000).toFixed(2);
+      document.getElementById('stat-elapsed').textContent = totalTime + 's ✅';
+      log(`🎉 RENDER COMPLETE — ${totalTiles} tiles in ${totalTime}s (${totalPixelsRendered.toLocaleString()} pixels)`, 'log-sys');
+    }
+
+    log(`⬅ render_update tile #${tilesReceived} (${startX},${startY}) ${width}×${height}  avg(${avgR},${avgG},${avgB})  lum ${entry.minLum}–${entry.maxLum}`, 'log-in');
   });
 
   socket.on('sync_geometry', (data) => {
@@ -188,22 +321,144 @@
   }
 
   function startRender() {
+    renderW = 320; renderH = 240;
     tilesReceived = 0;
+    totalPixelsRendered = 0;
+    tileTimings.length = 0;
+
+    // Resize canvases
+    renderCanvas.width = renderW;
+    renderCanvas.height = renderH;
+    overlayCanvas.width = renderW;
+    overlayCanvas.height = renderH;
+
+    // Clear canvases
+    renderCtx.fillStyle = '#0f0f19';
+    renderCtx.fillRect(0, 0, renderW, renderH);
+    overlayCtx.clearRect(0, 0, renderW, renderH);
+    document.getElementById('tile-list').innerHTML = '';
+
+    // Calculate expected tiles
+    const tileSize = 64;
+    const cols = Math.ceil(renderW / tileSize);
+    const rows = Math.ceil(renderH / tileSize);
+    totalTiles = cols * rows;
+    document.getElementById('stat-total').textContent = totalTiles;
+    document.getElementById('stat-tiles').textContent = '0';
+    document.getElementById('stat-pixels').textContent = '0';
+    document.getElementById('progress-fill').style.width = '0%';
+
+    // Show render section
+    document.getElementById('render-section').style.display = 'block';
+
+    // Start elapsed timer
+    renderStartTime = Date.now();
+    clearInterval(elapsedTimer);
+    elapsedTimer = setInterval(() => {
+      if (renderStartTime) {
+        document.getElementById('stat-elapsed').textContent =
+          ((Date.now() - renderStartTime) / 1000).toFixed(1) + 's';
+      }
+    }, 100);
+
     socket.emit('start_render', {
-      canvasWidth: 320,
-      canvasHeight: 240,
+      canvasWidth: renderW,
+      canvasHeight: renderH,
       camera: {
-        position: { x: 0, y: 2, z: 5 },
-        rotation: { x: 0, y: 0, z: 0 },
-        target: { x: 0, y: 0, z: 0 },
-        fov: 75,
-        near: 0.1,
-        far: 1000,
+        cameraPos: { x: 0, y: 2, z: 5 },
+        viewMatrix: [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
+        sunDir: { x: 1, y: 1, z: -1 },
       },
       sunDir: { x: 1, y: 1, z: -1 },
     });
-    log('➡ start_render 320×240', 'log-out');
+    log(`➡ start_render ${renderW}×${renderH} (${totalTiles} tiles expected)`, 'log-out');
   }
+
+  // ── Render helpers ──────────────────────────────────────
+  function drawTileOverlay(x, y, w, h, idx) {
+    overlayCtx.strokeStyle = 'rgba(138, 180, 248, 0.4)';
+    overlayCtx.lineWidth = 1;
+    overlayCtx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    // Tile number label
+    overlayCtx.fillStyle = 'rgba(255,255,255,0.6)';
+    overlayCtx.font = '9px monospace';
+    overlayCtx.fillText(String(idx), x + 2, y + 10);
+  }
+
+  function toggleOverlay() {
+    showOverlay = !showOverlay;
+    if (!showOverlay) {
+      overlayCtx.clearRect(0, 0, renderW, renderH);
+    } else {
+      // Redraw all tile overlays
+      overlayCtx.clearRect(0, 0, renderW, renderH);
+      tileTimings.forEach((t, i) => drawTileOverlay(t.startX, t.startY, t.width, t.height, i + 1));
+    }
+  }
+
+  function downloadRender() {
+    const a = document.createElement('a');
+    a.download = `ravana-render-${Date.now()}.png`;
+    a.href = renderCanvas.toDataURL('image/png');
+    a.click();
+  }
+
+  function clearCanvas() {
+    renderCtx.fillStyle = '#0f0f19';
+    renderCtx.fillRect(0, 0, renderW, renderH);
+    overlayCtx.clearRect(0, 0, renderW, renderH);
+    tilesReceived = 0;
+    totalPixelsRendered = 0;
+    tileTimings.length = 0;
+    renderStartTime = null;
+    clearInterval(elapsedTimer);
+    document.getElementById('stat-tiles').textContent = '0';
+    document.getElementById('stat-total').textContent = '?';
+    document.getElementById('stat-elapsed').textContent = '—';
+    document.getElementById('stat-avg-tile').textContent = '—';
+    document.getElementById('stat-pixels').textContent = '0';
+    document.getElementById('stat-throughput').textContent = '—';
+    document.getElementById('progress-fill').style.width = '0%';
+    document.getElementById('tile-list').innerHTML = '';
+    document.getElementById('pixel-info').textContent = 'Hover over the canvas to inspect pixels';
+    log('canvas cleared', 'log-sys');
+  }
+
+  function updateThroughput() {
+    if (!renderStartTime || tilesReceived === 0) return;
+    const elapsed = (Date.now() - renderStartTime) / 1000;
+    const tps = (tilesReceived / elapsed).toFixed(1);
+    const pps = Math.round(totalPixelsRendered / elapsed).toLocaleString();
+    document.getElementById('stat-throughput').textContent = tps + ' tiles/s';
+  }
+
+  function updateAvgTile() {
+    if (tileTimings.length < 2) return;
+    let totalGap = 0;
+    for (let i = 1; i < tileTimings.length; i++) {
+      totalGap += tileTimings[i].arrivedAt - tileTimings[i-1].arrivedAt;
+    }
+    const avg = (totalGap / (tileTimings.length - 1)).toFixed(0);
+    document.getElementById('stat-avg-tile').textContent = avg + 'ms';
+  }
+
+  // ── Pixel inspector (hover) ─────────────────────────────
+  renderCanvas.addEventListener('mousemove', (e) => {
+    const rect = renderCanvas.getBoundingClientRect();
+    const scaleX = renderCanvas.width / rect.width;
+    const scaleY = renderCanvas.height / rect.height;
+    const px = Math.floor((e.clientX - rect.left) * scaleX);
+    const py = Math.floor((e.clientY - rect.top) * scaleY);
+    if (px < 0 || py < 0 || px >= renderW || py >= renderH) return;
+    const data = renderCtx.getImageData(px, py, 1, 1).data;
+    const lum = Math.round(0.299 * data[0] + 0.587 * data[1] + 0.114 * data[2]);
+    document.getElementById('pixel-info').innerHTML =
+      `Pixel (${px}, ${py}) — `
+      + `<span style="color:rgb(${data[0]},${data[1]},${data[2]})">■</span> `
+      + `R:${data[0]} G:${data[1]} B:${data[2]} A:${data[3]} — Lum:${lum}`;
+  });
+  renderCanvas.style.cursor = 'crosshair';
+  renderCanvas.style.pointerEvents = 'auto';
 
   // ── Worker simulator ────────────────────────────────────
   function spawnWorker() {
@@ -276,6 +531,9 @@
   function updateWorkerCount() {
     document.getElementById('worker-count').textContent = workers.length;
   }
+
+  // Ensure overlay canvas pointer events are off
+  overlayCanvas.style.pointerEvents = 'none';
 </script>
 
 </body>

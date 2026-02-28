@@ -19,9 +19,20 @@ module.exports = {
   workerMasterMap: new Map(),
 
   /**
-   * Maps masterSocketId → geometry payload.
+   * Maps masterSocketId → geometry payload with extended rendering properties.
    * Each master's geocache is stored separately so workers and late-joiners
    * can receive the correct scene data for each master.
+   *
+   * Payload structure:
+   *   - camera: { position, rotation, target, fov, near, far } | null
+   *   - geometry: { meshCount, totalVertices, totalIndices, meshes[] }
+   *       Each mesh includes: positions, normals, uvs, indices, ao, vertexColors, bvh
+   *       Plus flags: hasNormals, hasUvs, hasBakedData, hasBvhData
+   *   - emission: { strength, texture, useEmission } | null (per-mesh emissive data)
+   *   - diffuse: { bsdf, albedo, roughness, metallic } | null (BSDF parameters)
+   *   - lighting: { ambientIntensity, shadowsEnabled, globalIllumination } (scene lighting config)
+   *   - shading: { shadingModel, normalMaps, parallaxMapping } (shading techniques)
+   *
    * @type {Map<string, object>}
    */
   geocache: new Map(),
